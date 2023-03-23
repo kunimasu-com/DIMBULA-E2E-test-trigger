@@ -1,0 +1,122 @@
+name: DIMBULA E2E test trigger
+description: "DIMBULA E2E test trigger."
+
+inputs:
+  client-id:
+    description: Your client id for DIMBULA.
+  app-token:
+    description: Your app token for DIMBULA.
+  app-artifact-path:
+    description: Your artifact path of Github which will be run if you want to test native application.
+  web-test-url:
+    description: Your URL which will be run if you want to test web base application.
+  api-url:
+    description: The URL which is DIMBULA API endpoint.
+    default: https://dimbula-api.kunimasu.com
+  workflow-run-id:
+    description: The current run id
+    default: ${{ github.run_id }}
+  head-sha:
+    description: The head sha of the repository for which the test will be run.
+    default: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.sha) || github.sha }}
+  branch:
+    description: The branch name of the repository for which the test will be run.
+    default: ${{ (github.event_name == 'pull_request' && github.head_ref) || github.ref_name }}
+  github-api-url:
+    description: The API URL of the GitHub server.
+    default: ${{ github.api_url }}
+  repository:
+    description: The full name of the repository for which the test will be run.
+    default: ${{ github.repository }}
+  working-directory:
+    description: The path of the directory where the YAML files describing the test conditions and procedures are stored.
+    default: .dimbula/e2e
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+    - run: |
+        pip install --upgrade pip
+        pip install -r $GITHUB_ACTION_PATH/requirements.txt
+      name: Setup trigger
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}/${{ inputs.branch }}
+    - run: |
+        client_id=${{ inputs.client-id }}
+        app_token=${{ inputs.app-token }}
+        api_url=${{ inputs.api-url }}
+        app_artifact_path=${{ inputs.app-artifact-path }}
+        web_test_url=${{ inputs.web-test-url }}
+        workflow_run_id=${{ inputs.workflow-run-id }}
+        
+        if [ -z "$app_artifact_path" ] && [ -z "$web_test_url" ]; then
+          echo Required either of app-artifact-path or web-test-url.
+          exit 1
+        fi
+        
+        if [ -n "$app_artifact_path" ]; then
+          file_type=apk
+          storage_access_token_url="$api_url"/githubStorageAccessToken
+          app_artifact_full_path=$GITHUB_WORKSPACE/${{ inputs.app-artifact-path }}        
+          
+          app_storage_url_resp=$(curl -s -X POST $storage_access_token_url \
+            -H "dimbula-api-version: 2023-03-22" \
+            -H "dimbula-app-token: $app_token" \
+            -H "dimbula-client-id: $client_id" \
+            -d "file_type=$file_type" \
+            -d "repository=${{ inputs.repository }}" \
+            -d "workflow_run_id=$workflow_run_id" \
+            -w "%{http_code}")
+          app_storage_url_ret_code=$?
+          if [ $app_storage_url_ret_code != 0 ]; then
+            echo Failed to upload apk. CURL return code: $app_storage_url_ret_code
+            exit 2
+          fi
+          app_storage_url_status=${app_storage_url_resp: -3:3}
+          app_storage_url=${app_storage_url_resp: 0:$((${#app_storage_url_resp} - 3))}        
+          if [ $app_storage_url_status != 200 ]; then
+            echo Failed to upload apk.
+            echo Status: $app_storage_url_status
+            echo Reason: $app_storage_url
+            exit 3
+          fi
+  
+          upload_app_ret_code=$(curl -s -X PUT \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            --data-binary @$app_artifact_full_path $app_storage_url)
+          if [ $upload_app_ret_code != 0 ]; then
+            echo Failed to upload apk. CURL return code: $app_storage_url_ret_code
+            exit 4
+          fi
+        fi
+                
+        test_plans=$(python3 $GITHUB_ACTION_PATH/src/main.py ./)
+        
+        test_trigger_url="$api_url"/githubTestTrigger
+        test_trigger_resp=$(curl -s -X POST $test_trigger_url \
+          -H "dimbula-api-version: 2023-03-22" \
+          -H "dimbula-app-token: $app_token" \
+          -H "dimbula-client-id: $client_id" \
+          -d "branch=${{ inputs.branch }}" \
+          -d "head_sha=${{ inputs.head-sha }}" \
+          -d "github_api_url=${{ inputs.github-api-url }}" \
+          -d "repository=${{ inputs.repository }}" \
+          -d "workflow_run_id=$workflow_run_id" \
+          -d "web_test_url=$web_test_url" \
+          -d "test_plans=$test_plans" \
+          -w "%{http_code}")
+        test_trigger_status=${test_trigger_resp: -3:3}
+        test_trigger_ret_message=${test_trigger_resp: 0:$((${#test_trigger_resp} - 3))}
+        if [ $test_trigger_status != 200 ]; then
+          echo Failed to start test.
+          echo Status: $test_trigger_status
+          echo Reason: $test_trigger_ret_message
+          exit 5
+        fi        
+
+      name: Trigger test
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}/${{ inputs.branch }}
